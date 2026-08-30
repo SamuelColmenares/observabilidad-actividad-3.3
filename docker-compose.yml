@@ -1,0 +1,172 @@
+﻿networks:
+  observability-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+services:
+  # ---------------------------------------------------------------------------
+  # 1. PostgreSQL Database Server (Code-First Persistence Engine)
+  # ---------------------------------------------------------------------------
+  postgres:
+    container_name: postgres
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-observability_db}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-observability_db}"]
+      interval: 3s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - observability-net
+
+  # ---------------------------------------------------------------------------
+  # 2. DataAccess Microservice (.NET 10 Minimal API - Central Data Layer)
+  # ---------------------------------------------------------------------------
+  data-access:
+    container_name: data-access
+    build:
+      context: ./DataAccess
+      dockerfile: Dockerfile
+    ports:
+      - "5003:8080"
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-observability_db}
+      - ConnectionStrings__DefaultConnection=Host=postgres;Port=5432;Database=${POSTGRES_DB:-observability_db};Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD:-postgres}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      - OpenTelemetry__OtlpEndpoint=http://otel-collector:4317
+    networks:
+      - observability-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+
+  # ---------------------------------------------------------------------------
+  # 3. Passengers Microservice (.NET 10 Minimal API)
+  # ---------------------------------------------------------------------------
+  passengers:
+    container_name: passengers
+    build:
+      context: ./Passengers
+      dockerfile: Dockerfile
+    ports:
+      - "5001:8080"
+    environment:
+      - DATA_ACCESS_URL=http://data-access:8080
+      - Services__DataAccessUrl=http://data-access:8080
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      - OpenTelemetry__OtlpEndpoint=http://otel-collector:4317
+    networks:
+      - observability-net
+    depends_on:
+      - data-access
+      - otel-collector
+
+  # ---------------------------------------------------------------------------
+  # 4. Checkin Microservice (.NET 10 Minimal API)
+  # ---------------------------------------------------------------------------
+  checkin:
+    container_name: checkin
+    build:
+      context: ./Checkin
+      dockerfile: Dockerfile
+    ports:
+      - "5002:8080"
+    environment:
+      - PASSENGERS_URL=http://passengers:8080
+      - DATA_ACCESS_URL=http://data-access:8080
+      - Services__PassengersUrl=http://passengers:8080
+      - Services__DataAccessUrl=http://data-access:8080
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      - OpenTelemetry__OtlpEndpoint=http://otel-collector:4317
+    networks:
+      - observability-net
+    depends_on:
+      - data-access
+      - passengers
+      - otel-collector
+
+  # ---------------------------------------------------------------------------
+  # 5. OpenTelemetry Collector (Telemetry Pipeline Router)
+  # ---------------------------------------------------------------------------
+  otel-collector:
+    container_name: otel-collector
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./config/otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317" # OTLP gRPC receiver
+      - "4318:4318" # OTLP HTTP receiver
+      - "8889:8889" # Prometheus metrics exporter
+      - "8888:8888" # Internal Collector metrics
+    networks:
+      - observability-net
+
+  # ---------------------------------------------------------------------------
+  # 6. Jaeger (Distributed Tracing Backend + UI)
+  # ---------------------------------------------------------------------------
+  jaeger:
+    container_name: jaeger
+    image: jaegertracing/all-in-one:1.58
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686" # Jaeger UI
+    networks:
+      - observability-net
+
+  # ---------------------------------------------------------------------------
+  # 7. Prometheus (Metrics Monitoring & AIOps Anomaly Alerts)
+  # ---------------------------------------------------------------------------
+  prometheus:
+    container_name: prometheus
+    image: prom/prometheus:latest
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./config/alerts.yml:/etc/prometheus/alerts.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - observability-net
+    depends_on:
+      - otel-collector
+
+  # ---------------------------------------------------------------------------
+  # 8. Grafana UI (Golden Signals & Traces Correlation)
+  # ---------------------------------------------------------------------------
+  grafana:
+    container_name: grafana
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000" # Grafana UI
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./config/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+      - grafana_data:/var/lib/grafana
+    networks:
+      - observability-net
+    depends_on:
+      - prometheus
+      - jaeger

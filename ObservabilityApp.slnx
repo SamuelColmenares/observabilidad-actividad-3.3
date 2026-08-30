@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="Checkin.Tests/Checkin.Tests.csproj" />
+  <Project Path="Checkin/Checkin.csproj" />
+  <Project Path="DataAccess/DataAccess.csproj" />
+  <Project Path="Passengers.Tests/Passengers.Tests.csproj" />
+  <Project Path="Passengers/Passengers.csproj" />
+</Solution>

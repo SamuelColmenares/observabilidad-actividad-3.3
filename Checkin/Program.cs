@@ -1,0 +1,362 @@
+﻿using System.Diagnostics;
+using System.Net;
+using System.Net.Http.Json;
+using Checkin.Models;
+using Checkin.Telemetry;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging.Console;
+using OpenTelemetry.Exporter;
+using OpenTelemetry.Logs;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// -----------------------------------------------------------------------------
+// OpenTelemetry Configuration
+// -----------------------------------------------------------------------------
+static string ResolveOtlpEndpoint(string? envValue, string? configValue) =>
+    !string.IsNullOrWhiteSpace(envValue) ? envValue :
+    !string.IsNullOrWhiteSpace(configValue) ? configValue :
+    "http://localhost:4317";
+
+static bool ResolveObservabilityEnabled(string? envValue) =>
+    !string.Equals(envValue, "false", StringComparison.OrdinalIgnoreCase);
+
+var observabilityEnabled = ResolveObservabilityEnabled(
+    Environment.GetEnvironmentVariable("OBSERVABILITY_ENABLED"));
+
+if (observabilityEnabled)
+{
+    var otlpEndpoint = ResolveOtlpEndpoint(
+        Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_ENDPOINT"),
+        builder.Configuration["OpenTelemetry:OtlpEndpoint"]);
+
+    var resourceBuilder = ResourceBuilder.CreateDefault()
+        .AddService(serviceName: Diagnostics.ServiceName, serviceVersion: Diagnostics.ServiceVersion)
+        .AddAttributes(new Dictionary<string, object>
+        {
+            ["deployment.environment"] = Environment.GetEnvironmentVariable("DEPLOYMENT_ENVIRONMENT") ?? "local",
+            ["cloud.provider"] = Environment.GetEnvironmentVariable("CLOUD_PROVIDER") ?? "local",
+            ["host.name"] = Environment.MachineName
+        });
+
+    // 1. Configure OpenTelemetry Tracing
+    builder.Services.AddOpenTelemetry()
+        .WithTracing(tracing =>
+        {
+            tracing
+                .SetResourceBuilder(resourceBuilder)
+                .AddSource(Diagnostics.ServiceName)
+                .AddAspNetCoreInstrumentation(options =>
+                {
+                    options.RecordException = true;
+                })
+                .AddHttpClientInstrumentation(options =>
+                {
+                    options.RecordException = true;
+                })
+                .AddOtlpExporter(options =>
+                {
+                    options.Endpoint = new Uri(otlpEndpoint);
+                    options.Protocol = OtlpExportProtocol.Grpc;
+                });
+        })
+        // 2. Configure OpenTelemetry Metrics
+        .WithMetrics(metrics =>
+        {
+            metrics
+                .SetResourceBuilder(resourceBuilder)
+                .AddMeter(Diagnostics.ServiceName)
+                .AddMeter("Microsoft.AspNetCore.Hosting")
+                .AddMeter("Microsoft.AspNetCore.Server.Kestrel")
+                .AddMeter("System.Net.Http")
+                .AddAspNetCoreInstrumentation()
+                .AddHttpClientInstrumentation()
+                .AddRuntimeInstrumentation()
+                .AddOtlpExporter((options, readerOptions) =>
+                {
+                    options.Endpoint = new Uri(otlpEndpoint);
+                    options.Protocol = OtlpExportProtocol.Grpc;
+                    readerOptions.PeriodicExportingMetricReaderOptions.ExportIntervalMilliseconds = 2000;
+                });
+        });
+
+    // 3. Configure OpenTelemetry Logging
+    builder.Logging.ClearProviders();
+    builder.Logging.AddConsole(options => options.FormatterName = OtelJsonConsoleFormatter.FormatterName)
+        .AddConsoleFormatter<OtelJsonConsoleFormatter, ConsoleFormatterOptions>();
+    builder.Logging.AddOpenTelemetry(logging =>
+    {
+        logging.SetResourceBuilder(resourceBuilder);
+        logging.IncludeScopes = true;
+        logging.IncludeFormattedMessage = true;
+        logging.AddOtlpExporter(options =>
+        {
+            options.Endpoint = new Uri(otlpEndpoint);
+            options.Protocol = OtlpExportProtocol.Grpc;
+        });
+    });
+}
+else
+{
+    builder.Logging.ClearProviders();
+    builder.Logging.AddSimpleConsole(options =>
+    {
+        options.IncludeScopes = false;
+        options.SingleLine = true;
+    });
+    Console.WriteLine("[Startup] OBSERVABILITY_ENABLED=false -> OpenTelemetry pipeline disabled.");
+}
+
+// -----------------------------------------------------------------------------
+// HttpClient Configuration (Passengers & DataAccess Microservices)
+// -----------------------------------------------------------------------------
+var passengersUrl = Environment.GetEnvironmentVariable("PASSENGERS_URL")
+                    ?? builder.Configuration["Services:PassengersUrl"] 
+                    ?? "http://localhost:5001";
+
+var dataAccessUrl = Environment.GetEnvironmentVariable("DATA_ACCESS_URL")
+                    ?? builder.Configuration["Services:DataAccessUrl"]
+                    ?? "http://localhost:5003";
+
+builder.Services.AddHttpClient("PassengersClient", client =>
+{
+    client.BaseAddress = new Uri(passengersUrl);
+    client.Timeout = TimeSpan.FromSeconds(10);
+});
+
+builder.Services.AddHttpClient("DataAccessClient", client =>
+{
+    client.BaseAddress = new Uri(dataAccessUrl);
+    client.Timeout = TimeSpan.FromSeconds(10);
+});
+
+var app = builder.Build();
+
+// -----------------------------------------------------------------------------
+// Middleware: Structured Logging & Correlation ID Propagation
+// -----------------------------------------------------------------------------
+app.Use(async (context, next) =>
+{
+    const string CorrelationHeader = "X-Correlation-ID";
+    var correlationId = context.Request.Headers[CorrelationHeader].FirstOrDefault() 
+                        ?? Activity.Current?.TraceId.ToString() 
+                        ?? Guid.NewGuid().ToString();
+
+    context.Response.Headers[CorrelationHeader] = correlationId;
+    Activity.Current?.SetTag("correlation_id", correlationId);
+
+    var logger = context.RequestServices.GetRequiredService<ILogger<Program>>();
+    using (logger.BeginScope(new Dictionary<string, object>
+    {
+        ["CorrelationId"] = correlationId,
+        ["TraceId"] = Activity.Current?.TraceId.ToString() ?? string.Empty
+    }))
+    {
+        await next();
+    }
+});
+
+// -----------------------------------------------------------------------------
+// API Endpoints
+// -----------------------------------------------------------------------------
+
+app.MapGet("/health", () => Results.Ok(new
+{
+    status = "Healthy",
+    service = Diagnostics.ServiceName,
+    timestamp = DateTime.UtcNow
+}));
+
+/// <summary>
+/// GET /checkin/{id} - Retrieve checkin record from DataAccess service.
+/// </summary>
+app.MapGet("/checkin/{id}", async (
+    string id,
+    IHttpClientFactory httpClientFactory,
+    HttpContext httpContext,
+    ILogger<Program> logger) =>
+{
+    using var activity = Diagnostics.ActivitySource.StartActivity("GetCheckinById");
+    activity?.SetTag("checkin.id", id);
+
+    var dataAccessClient = httpClientFactory.CreateClient("DataAccessClient");
+    var correlationId = httpContext.Response.Headers["X-Correlation-ID"].FirstOrDefault();
+    if (!string.IsNullOrEmpty(correlationId))
+    {
+        dataAccessClient.DefaultRequestHeaders.Remove("X-Correlation-ID");
+        dataAccessClient.DefaultRequestHeaders.Add("X-Correlation-ID", correlationId);
+    }
+
+    try
+    {
+        var response = await dataAccessClient.GetAsync($"/checkins/{Uri.EscapeDataString(id)}");
+        if (response.StatusCode == HttpStatusCode.NotFound)
+        {
+            return Results.NotFound(new { message = $"Checkin '{id}' not found." });
+        }
+        var content = await response.Content.ReadAsStringAsync();
+        return Results.Content(content, "application/json", statusCode: (int)response.StatusCode);
+    }
+    catch (Exception ex)
+    {
+        activity?.AddException(ex);
+        activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+        logger.LogError(ex, "Error fetching checkin {Id} from DataAccess", id);
+        return Results.Problem(detail: ex.Message, statusCode: 502);
+    }
+});
+
+/// <summary>
+/// POST /checkin - Process passenger check-in.
+/// Validates passenger with Passengers service via HTTP and stores record in PostgreSQL via DataAccess.
+/// Supports simulation parameters: ?delay=ms and ?error=true.
+/// </summary>
+app.MapPost("/checkin", async (
+    [FromBody] CheckinRequest request,
+    [FromQuery] int? delay,
+    [FromQuery] bool? error,
+    IHttpClientFactory httpClientFactory,
+    HttpContext httpContext,
+    ILogger<Program> logger) =>
+{
+    using var activity = Diagnostics.ActivitySource.StartActivity("ProcessCheckin");
+    activity?.SetTag("passenger.id", request.PassengerId);
+    activity?.SetTag("flight.number", request.FlightNumber);
+    activity?.SetTag("seat.number", request.SeatNumber);
+
+    Diagnostics.CheckinRequestCounter.Add(1);
+
+    // Simulate artificial delay if requested
+    if (delay.HasValue && delay.Value > 0)
+    {
+        activity?.SetTag("simulation.delay_ms", delay.Value);
+        Diagnostics.CheckinDelayHistogram.Record(delay.Value);
+        logger.LogInformation("Simulating artificial delay of {Delay} ms for POST /checkin", delay.Value);
+        await Task.Delay(delay.Value);
+    }
+
+    // Simulate forced error if requested
+    if (error == true)
+    {
+        activity?.SetTag("simulation.forced_error", true);
+        activity?.SetStatus(ActivityStatusCode.Error, "Forced error requested via query parameter");
+        Diagnostics.CheckinErrorCounter.Add(1, new KeyValuePair<string, object?>("reason", "forced_error"));
+        logger.LogError("Forced error triggered for POST /checkin");
+        return Results.Problem(
+            detail: "Forced error simulated as requested by parameter error=true.",
+            statusCode: StatusCodes.Status500InternalServerError,
+            title: "Simulated Internal Server Error");
+    }
+
+    // 1. Call Passengers microservice via HTTP to validate passenger
+    var passengersClient = httpClientFactory.CreateClient("PassengersClient");
+    var correlationId = httpContext.Response.Headers["X-Correlation-ID"].FirstOrDefault();
+    if (!string.IsNullOrEmpty(correlationId))
+    {
+        passengersClient.DefaultRequestHeaders.Remove("X-Correlation-ID");
+        passengersClient.DefaultRequestHeaders.Add("X-Correlation-ID", correlationId);
+    }
+
+    logger.LogInformation("Validating passenger {PassengerId} via Passengers service...", request.PassengerId);
+    
+    using var validationActivity = Diagnostics.ActivitySource.StartActivity("ValidatePassengerHttp");
+    HttpResponseMessage response;
+    try
+    {
+        response = await passengersClient.GetAsync($"/passengers/{Uri.EscapeDataString(request.PassengerId)}");
+    }
+    catch (Exception ex)
+    {
+        validationActivity?.AddException(ex);
+        validationActivity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+        Diagnostics.CheckinErrorCounter.Add(1, new KeyValuePair<string, object?>("reason", "passengers_service_unreachable"));
+        logger.LogError(ex, "Failed to reach Passengers microservice at {PassengersUrl}", passengersUrl);
+        return Results.Problem(
+            detail: $"Failed to connect to Passengers service: {ex.Message}",
+            statusCode: StatusCodes.Status502BadGateway,
+            title: "Bad Gateway");
+    }
+
+    if (response.StatusCode == HttpStatusCode.NotFound)
+    {
+        validationActivity?.SetStatus(ActivityStatusCode.Error, "Passenger not found");
+        Diagnostics.CheckinErrorCounter.Add(1, new KeyValuePair<string, object?>("reason", "passenger_not_found"));
+        logger.LogWarning("Validation failed: Passenger {PassengerId} does not exist in Passengers service", request.PassengerId);
+        return Results.NotFound(new { message = $"Passenger '{request.PassengerId}' not found. Check-in rejected." });
+    }
+
+    if (!response.IsSuccessStatusCode)
+    {
+        validationActivity?.SetStatus(ActivityStatusCode.Error, $"Passengers service returned {response.StatusCode}");
+        Diagnostics.CheckinErrorCounter.Add(1, new KeyValuePair<string, object?>("reason", "passengers_service_error"));
+        logger.LogError("Validation error: Passengers service returned HTTP {StatusCode}", response.StatusCode);
+        return Results.Problem(
+            detail: $"Passengers service returned HTTP {response.StatusCode}",
+            statusCode: StatusCodes.Status502BadGateway,
+            title: "Upstream Validation Error");
+    }
+
+    var passengerInfo = await response.Content.ReadFromJsonAsync<PassengerDto>();
+    logger.LogInformation("Passenger {PassengerId} ({FirstName} {LastName}) validated successfully", 
+        request.PassengerId, passengerInfo?.FirstName, passengerInfo?.LastName);
+
+    // 2. Persist Check-in record in PostgreSQL via DataAccess service
+    var checkinId = $"CHK-{Guid.NewGuid().ToString("N")[..8].ToUpper()}";
+    activity?.SetTag("checkin.id", checkinId);
+
+    var checkinRecord = new CheckinRecord
+    {
+        Id = checkinId,
+        PassengerId = request.PassengerId,
+        FlightNumber = request.FlightNumber,
+        SeatNumber = request.SeatNumber,
+        BaggageCount = request.BaggageCount,
+        Status = "COMPLETED",
+        CreatedAt = DateTime.UtcNow
+    };
+
+    var dataAccessClient = httpClientFactory.CreateClient("DataAccessClient");
+    if (!string.IsNullOrEmpty(correlationId))
+    {
+        dataAccessClient.DefaultRequestHeaders.Remove("X-Correlation-ID");
+        dataAccessClient.DefaultRequestHeaders.Add("X-Correlation-ID", correlationId);
+    }
+
+    using var dataAccessActivity = Diagnostics.ActivitySource.StartActivity("PersistCheckinDataAccess");
+    try
+    {
+        var saveResponse = await dataAccessClient.PostAsJsonAsync("/checkins", checkinRecord);
+        if (!saveResponse.IsSuccessStatusCode)
+        {
+            dataAccessActivity?.SetStatus(ActivityStatusCode.Error, $"DataAccess returned {saveResponse.StatusCode}");
+            Diagnostics.CheckinErrorCounter.Add(1, new KeyValuePair<string, object?>("reason", "data_access_error"));
+            logger.LogError("DataAccess returned HTTP {StatusCode} when persisting checkin {CheckinId}", saveResponse.StatusCode, checkinId);
+            return Results.Problem(detail: "Failed to persist check-in record.", statusCode: (int)saveResponse.StatusCode);
+        }
+    }
+    catch (Exception ex)
+    {
+        dataAccessActivity?.AddException(ex);
+        dataAccessActivity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+        Diagnostics.CheckinErrorCounter.Add(1, new KeyValuePair<string, object?>("reason", "data_access_unreachable"));
+        logger.LogError(ex, "Error storing check-in record {CheckinId} in DataAccess", checkinId);
+        return Results.Problem(
+            detail: "Failed to persist check-in record to database.",
+            statusCode: StatusCodes.Status500InternalServerError);
+    }
+
+    Diagnostics.CheckinSuccessCounter.Add(1);
+    logger.LogInformation("Check-in process completed successfully. Checkin ID: {CheckinId}", checkinId);
+
+    return Results.Created($"/checkin/{checkinId}", new
+    {
+        message = "Check-in completed successfully",
+        checkinRecord,
+        passenger = passengerInfo
+    });
+});
+
+app.Run();

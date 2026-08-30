@@ -1,0 +1,25 @@
+﻿groups:
+  - name: aiops_anomaly_correlation_rules
+    rules:
+      - alert: CorrelatedErrorRateAndLatencyAnomaly
+        expr: |
+          (
+            rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[2m]) 
+            > 
+            (
+              avg_over_time(rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[10m])[30m:1m]) 
+              + 2 * stddev_over_time(rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[10m])[30m:1m])
+            )
+          )
+          and
+          (
+            histogram_quantile(0.99, sum(rate(http_server_request_duration_seconds_bucket[2m])) by (le)) > 0.200
+          )
+        for: 10s
+        labels:
+          severity: critical
+          category: anomaly_detection
+        annotations:
+          summary: "Anomalía correlacionada detectada en {{ $labels.service_name }}"
+          description: "La tasa de error superó el baseline + 2σ Y la latencia P99 superó el umbral SLO (200ms). Inspeccionar trazas en Jaeger para extraer el trace_id del request fallido."
+          runbook_url: "http://localhost:16686/search?service={{ $labels.service_name }}&state=error"
