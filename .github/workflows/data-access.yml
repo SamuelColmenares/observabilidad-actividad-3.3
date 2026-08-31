@@ -1,21 +1,19 @@
 # =============================================================================
-# Passengers CI/CD — Build, Test & Deploy to GKE Cluster v2
+# DataAccess CI/CD — Build, Test & Deploy to GKE Cluster v2
 # =============================================================================
 
-name: Passengers CI/CD
+name: DataAccess CI/CD
 
 on:
   push:
     branches: [main]
     paths:
-      - 'Passengers/**'
-      - 'Passengers.Tests/**'
-      - 'k8s/gcp/08-passengers.yaml'
+      - 'DataAccess/**'
+      - 'k8s/gcp/07-data-access.yaml'
   pull_request:
     branches: [main]
     paths:
-      - 'Passengers/**'
-      - 'Passengers.Tests/**'
+      - 'DataAccess/**'
   workflow_dispatch:
 
 env:
@@ -23,19 +21,19 @@ env:
   REGION: us-central1
   CLUSTER_NAME: ${{ secrets.GKE_CLUSTER_NAME_V2 }}
   CLUSTER_REGION: ${{ secrets.GKE_CLUSTER_REGION || 'us-central1' }}
-  SERVICE_NAME: passengers
+  SERVICE_NAME: data-access
   NAMESPACE: apps
   ARTIFACT_REGISTRY: us-central1-docker.pkg.dev
-  IMAGE_NAME: us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/actividad-3-3/passengers
+  IMAGE_NAME: us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/actividad-3-3/data-access
 
 permissions:
   contents: read
   id-token: write
 
 jobs:
-  # ── Job 1: Build & Test (CI) ────────────────────────────────────────────────
+  # ── Job 1: Build (CI) ───────────────────────────────────────────────────────
   build-and-test:
-    name: Build and Test Passengers Service
+    name: Build DataAccess Service
     runs-on: ubuntu-latest
 
     steps:
@@ -49,24 +47,11 @@ jobs:
 
       - name: Restore dependencies
         run: |
-          dotnet restore Passengers/Passengers.csproj
-          dotnet restore Passengers.Tests/Passengers.Tests.csproj
+          dotnet restore DataAccess/DataAccess.csproj
 
-      - name: Build solution and tests
+      - name: Build project
         run: |
-          dotnet build Passengers/Passengers.csproj --no-restore -c Release
-          dotnet build Passengers.Tests/Passengers.Tests.csproj --no-restore -c Release
-
-      - name: Run unit tests
-        run: dotnet test Passengers.Tests/Passengers.Tests.csproj --no-build -c Release --logger "trx;LogFileName=test-results.trx" --results-directory ./test-results
-
-      - name: Upload test results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: passengers-test-results
-          path: test-results/
-          retention-days: 7
+          dotnet build DataAccess/DataAccess.csproj --no-restore -c Release
 
   # ── Job 2: Build & Push Docker Image (CD) ───────────────────────────────────
   build-and-push:
@@ -112,14 +97,14 @@ jobs:
           docker build \
             -t ${{ env.IMAGE_NAME }}:${IMAGE_TAG} \
             -t ${{ env.IMAGE_NAME }}:latest \
-            ./Passengers
+            ./DataAccess
 
           docker push ${{ env.IMAGE_NAME }}:${IMAGE_TAG}
           docker push ${{ env.IMAGE_NAME }}:latest
 
   # ── Job 3: Deploy to GKE (CD) ───────────────────────────────────────────────
   deploy-gke:
-    name: Deploy Passengers to GKE
+    name: Deploy DataAccess to GKE
     runs-on: ubuntu-latest
     needs: build-and-push
     if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
@@ -154,31 +139,15 @@ jobs:
 
           sed \
             -e "s|GCP_PROJECT_ID_PLACEHOLDER|${{ env.PROJECT_ID }}|g" \
-            -e "s|:${IMAGE_TAG}|:${IMAGE_TAG}|g" \
-            k8s/gcp/08-passengers.yaml | kubectl apply -f -
-
-          # Apply HPA (1 to 3 pods)
-          kubectl apply -f k8s/gcp/10-hpa.yaml
+            k8s/gcp/07-data-access.yaml | kubectl apply -f -
 
           # Update container image to exact tag
-          kubectl set image deployment/passengers passengers=${{ env.IMAGE_NAME }}:${IMAGE_TAG} -n ${{ env.NAMESPACE }}
+          kubectl set image deployment/data-access data-access=${{ env.IMAGE_NAME }}:${IMAGE_TAG} -n ${{ env.NAMESPACE }}
 
       - name: Wait for Rollout
         run: |
-          kubectl rollout status deployment/passengers -n ${{ env.NAMESPACE }} --timeout=180s
+          kubectl rollout status deployment/data-access -n ${{ env.NAMESPACE }} --timeout=180s
 
-      - name: Get Public LoadBalancer IP and smoke test
+      - name: Verify Internal Service
         run: |
-          echo "Waiting for LoadBalancer external IP..."
-          for i in $(seq 1 18); do
-            IP=$(kubectl get svc passengers -n ${{ env.NAMESPACE }} \
-              -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-            if [ -n "$IP" ]; then break; fi
-            sleep 10
-          done
-
-          echo "PASSENGERS_PUBLIC_IP=${IP:-<pending>}" | tee -a $GITHUB_STEP_SUMMARY
-          if [ -n "$IP" ]; then
-            echo "Smoke test health check at http://${IP}:5001/health..."
-            curl -s -o /dev/null -w "%{http_code}" "http://${IP}:5001/health" || echo "Service starting up"
-          fi
+          kubectl get svc data-access -n ${{ env.NAMESPACE }}

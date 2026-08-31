@@ -1,9 +1,8 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# k8s/gcp/01-configmaps.yaml — Configuración de Collector, Prometheus y Grafana
+# k8s/gcp/01-configmaps.yaml — Configuración de Collector, Prometheus, Grafana y Apps
 # ═══════════════════════════════════════════════════════════════════════════
 ---
-# ── OTel Collector: mismo pipeline que config/otel-collector-config.yaml local,
-# ── más el exporter googlecloud (logs → Cloud Logging) y el project id via env.
+# ── OTel Collector ConfigMap
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -20,13 +19,10 @@ data:
             endpoint: 0.0.0.0:4318
 
     processors:
-      # memory_limiter primero: evita que un pico de telemetría agote la memoria
-      # del pod y lo tumbe (un Collector caído es peor que datos perdidos).
       memory_limiter:
         check_interval: 1s
         limit_mib: 400
         spike_limit_mib: 100
-      # resource enriquece todas las señales con atributos del entorno GCP.
       resource:
         attributes:
           - action: insert
@@ -49,7 +45,7 @@ data:
       googlecloud:
         project: ${env:GCP_PROJECT_ID}
         log:
-          default_log_name: actividad-2-2-otel
+          default_log_name: actividad-3-3-otel
       debug:
         verbosity: normal
 
@@ -69,12 +65,16 @@ data:
           exporters: [googlecloud, debug]
       telemetry:
         metrics:
-          # Métricas internas del propio Collector (CPU, spans rechazados, etc.)
-          address: 0.0.0.0:8888
           level: detailed
+          readers:
+            - pull:
+                exporter:
+                  prometheus:
+                    host: 0.0.0.0
+                    port: 8888
 
 ---
-# ── Prometheus: scrapea el endpoint del Collector expuesto por el Service.
+# ── Prometheus ConfigMap (con scraping y alertas AIOps)
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -86,36 +86,48 @@ data:
       scrape_interval: 15s
       evaluation_interval: 15s
 
+    rule_files:
+      - /etc/prometheus/alerts.yml
+
     scrape_configs:
       - job_name: 'otel-collector'
         static_configs:
-          - targets: ['otel-collector:8889']
+          - targets: ['otel-collector.observability.svc.cluster.local:8889']
 
       - job_name: 'otel-collector-internal'
         static_configs:
-          - targets: ['otel-collector:8888']
+          - targets: ['otel-collector.observability.svc.cluster.local:8888']
+
+  alerts.yml: |
+    groups:
+      - name: aiops_anomaly_correlation_rules
+        rules:
+          - alert: CorrelatedErrorRateAndLatencyAnomaly
+            expr: |
+              (
+                rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[2m]) 
+                > 
+                (
+                  avg_over_time(rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[10m])[30m:1m]) 
+                  + 2 * stddev_over_time(rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[10m])[30m:1m])
+                )
+              )
+              and
+              (
+                histogram_quantile(0.99, sum(rate(http_server_request_duration_seconds_bucket[2m])) by (le)) > 0.200
+              )
+            for: 10s
+            labels:
+              severity: critical
+              category: aiops_correlation_anomaly
+              component: data-access-service
+            annotations:
+              summary: "Anomalía Correlacionada en DataAccess: Error Rate > baseline + 2σ Y Latencia P99 > 200ms"
+              description: "Se detectó un incremento anómalo simultáneo en la tasa de error 5xx y en la latencia P99 (> 200ms SLO)."
+              runbook_url: "http://jaeger.observability.svc.cluster.local:16686/search?service=data-access-service&tags=%7B%22error%22%3A%22true%22%7D"
 
 ---
-# ── Grafana: datasources provisionados (Prometheus, Jaeger, Google Cloud Logging).
-# El datasource "Google Cloud Logging" usa authenticationType: gce, es decir,
-# se autentica con la identidad del pod (Workload Identity) — ver 05-grafana.yaml.
-#
-# Redirección logs → traza (trace_id ya viaja en cada log JSON, ver
-# Passengers/Telemetry/OtelJsonConsoleFormatter.cs). El datasource nativo de
-# Google Cloud Logging SOLO soporta "logs to traces" hacia Google Cloud Trace
-# (jsonData.logsToTraces), no hacia Jaeger, así que la redirección hacia Jaeger
-# se implementa con el mecanismo genérico de Grafana "Correlations" (GA desde
-# Grafana 10.3), definido como subsección del datasource de origen (Cloud
-# Logging) apuntando al datasource destino (Jaeger) por UID.
-#
-# ⚠️ El nombre exacto del campo (`correlations[].config.field`) depende de cómo
-# el plugin de Cloud Logging aplana el JSON del log en el resultado de Explore.
-# Se usa "jsonPayload.trace_id" como valor esperado (Cloud Run parsea el stdout
-# JSON de la app como jsonPayload). Si al probar el link "Ver traza en Jaeger"
-# no aparece o no resuelve, verificar el nombre real del campo con Explore →
-# seleccionar "Google Cloud Logging" → correr una query → Query Inspector →
-# ajustar el valor de "field" aquí (o directamente en Administration →
-# Correlations en la UI de Grafana) y reaplicar este ConfigMap.
+# ── Grafana Datasources
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -129,7 +141,7 @@ data:
         uid: prometheus
         type: prometheus
         access: proxy
-        url: http://prometheus:9090
+        url: http://prometheus.observability.svc.cluster.local:9090
         isDefault: true
         jsonData:
           timeInterval: 5s
@@ -138,7 +150,7 @@ data:
         uid: jaeger
         type: jaeger
         access: proxy
-        url: http://jaeger:16686
+        url: http://jaeger.observability.svc.cluster.local:16686
         jsonData:
           spanBar:
             type: 'Tag'
@@ -160,3 +172,17 @@ data:
               target:
                 queryType: "traceID"
                 query: "${__value.raw}"
+
+---
+# ── ConfigMap para Microservicios (Namespace: apps)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-env-config
+  namespace: apps
+data:
+  ENVIRONMENT: "Production"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.observability.svc.cluster.local:4317"
+  Services__DataAccessUrl: "http://data-access.apps.svc.cluster.local:5003"
+  Services__PassengersUrl: "http://passengers.apps.svc.cluster.local:5001"
+

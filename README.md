@@ -1,277 +1,324 @@
-﻿# Actividad 3.3: Laboratorio de Observabilidad End-to-End con Microservicios en .NET 10
+# Actividad 3.3: Observabilidad End-to-End en Microservicios .NET 10, GKE, OTel y Chaos Engineering
 
-Este repositorio contiene la implementación completa de una arquitectura observable de microservicios basada en **.NET 10 Minimal API**, instrumentada con **OpenTelemetry SDK** (3 pilares: trazas distribuidas, métricas y logs estructurados correlacionados), capa centralizada de acceso a datos **DataAccess** con **EF Core Code-First** sobre **PostgreSQL**, y spans de base de datos con **OTel DB Semantic Conventions**.
-
----
-
-## 📊 Resumen Ejecutivo y Estado de la Solución
-
-- **Arquitectura de Microservicios Desacoplada**:
-  - `Passengers` (:5001): Microservicio de negocio de pasajeros. Desacoplado de la base de datos; consume `DataAccess` vía REST con propagación de contexto W3C (`traceparent`).
-  - `Checkin` (:5002): Microservicio de negocio de checkin de vuelos. Valida pasajeros contra `Passengers` y persiste registros en `DataAccess` vía REST.
-  - `DataAccess` (:5003): Microservicio central de acceso a datos (.NET 10 Minimal API) con **EF Core Code-First** conectado a **PostgreSQL** (`observability_db`).
-- **Base de Datos Unificada**:
-  - Eliminado Couchbase por completo.
-  - Persistencia relacional única en PostgreSQL con volumen persistente nombrado `postgres_data`.
-- **Instrumentación OpenTelemetry Completa (3 Pilares)**:
-  - **Trazas**: `OpenTelemetry.Instrumentation.AspNetCore`, `OpenTelemetry.Instrumentation.Http` y spans semánticos de base de datos (`OpenTelemetry.Instrumentation.EntityFrameworkCore` y `Npgsql.OpenTelemetry` con `db.statement` y `db.system = "postgresql"`).
-  - **Métricas**: `OpenTelemetry.Instrumentation.Runtime`, ASP.NET Core y métricas de negocio personalizadas vía `System.Diagnostics.Metrics`.
-  - **Logs**: Formateador JSON estructurado (`OtelJsonConsoleFormatter`) enriquecido automáticamente con `trace_id` y `span_id`.
-- **Backends de Observabilidad Locales**:
-  - **Jaeger UI (:16686)**: Visualización y análisis de trazas distribuidas y spans de base de datos.
-  - **Prometheus (:9090)**: Ingesta de métricas y evaluación de reglas de detección de anomalías AIOps.
-  - **Grafana (:3000)**: Dashboards de Golden Signals correlacionados con Jaeger y Prometheus.
-  - **Volúmenes Persistentes**: `postgres_data`, `prometheus_data`, `grafana_data`.
+Este repositorio contiene la solución integral para el laboratorio de observabilidad distribuida, compuesta por tres microservicios en **.NET 10 Minimal API**, capa centralizada de persistencia **DataAccess** con **EF Core Code-First** sobre **PostgreSQL**, instrumentación de **OpenTelemetry SDK** (3 pilares: trazas, métricas y logs estructurados correlacionados), **spans semánticos de base de datos** (`OTel DB Semantic Conventions`), stack completo de observabilidad desplegado en **Google Kubernetes Engine (GKE Standard)**, detección de anomalías **AIOps**, observabilidad de red con **VPC Flow Logs**, y resiliencia con **Chaos Mesh**.
 
 ---
 
-## 🏗️ Diagrama de Arquitectura del Sistema
+## 📊 Arquitectura del Sistema en GKE
 
 ```text
-                           [ Cliente / Pruebas / k6 ]
-                                        │
-                      ┌─────────────────┴─────────────────┐
-                      ▼                                   ▼
-            [ Passengers Service ]               [ Checkin Service ]
-             (HTTP REST :5001)                   (HTTP REST :5002)
-                      │                                   │
-                      │                                   ├───> (Valida Pasajero HTTP)
-                      │                                   │
-                      └─────────────────┬─────────────────┘
-                                        ▼ (HTTP REST + W3C TraceContext)
-                              [ DataAccess Service ]
-                        (.NET 10 Minimal API - Puerto :5003)
-                                        │
-                                        │ (EF Core Code-First + OTel DB Spans)
-                                        ▼
-                                [ PostgreSQL :5432 ]
-                               (Base: observability_db)
-                                        │
-           ┌────────────────────────────┴────────────────────────────┐
-           │                  Telemetría OTLP (4317)                 │
-           ▼                                                         ▼
-   [ OTel Collector ] ────► [ Jaeger :16686 ] (Trazas Distribuidas & DB Spans)
-           ├──────────────► [ Prometheus :9090 ] (Métricas & Reglas de Anomalías AIOps)
-           └──────────────► [ Grafana :3000 ] (Dashboards & Correlación Trace-Log)
+                                  [ Internet / Tráfico Externo ]
+                                                 │
+                      ┌──────────────────────────┴──────────────────────────┐
+                      ▼                                                     ▼
+        [ Passengers Microservice ]                               [ Checkin Microservice ]
+        • K8s LoadBalancer Público (:5001)                        • K8s LoadBalancer Público (:5002)
+        • HPA: 1 a 3 réplicas                                     • HPA: 1 a 3 réplicas
+        • Namespace: apps                                         • Namespace: apps
+                      │                                                     │
+                      │                                 ┌───────────────────┘ (Valida Pasajero HTTP)
+                      │                                 ▼
+                      └────────────────────────► [ DataAccess Microservice ]
+                                                 • K8s ClusterIP Interno (:5003)
+                                                 • Namespace: apps (Acceso estrictamente interno)
+                                                 • EF Core Code-First + OTel DB Spans
+                                                        │
+                                                        ▼
+                                                 [ PostgreSQL 16 ]
+                                                 • K8s ClusterIP (:5432) + PVC 10Gi
+                                                 • Namespace: apps
+                                                        │
+         ┌──────────────────────────────────────────────┴──────────────────────────────────────────────┐
+         │                                   Telemetría OTLP (:4317)                                   │
+         ▼                                                                                            ▼
+ [ OTel Collector ] ────────────────────► [ Jaeger UI :16686 ] (LoadBalancer Público + PVC 5Gi)
+ • DaemonSet (1 agente por nodo GKE)     ├─────────────────────► [ Prometheus :9090 ] (LoadBalancer Público + PVC 10Gi)
+ • Namespace: observability              └─────────────────────► [ Grafana :3000 ] (LoadBalancer Público + PVC 5Gi)
+                                                                 • Datasources: Prometheus, Jaeger, Cloud Logging
+                                                                 • Correlación Log ↔ Traza
+ 
+ [ Chaos Mesh ] ───► Inyección de fallas: NetworkChaos (200ms latency), PodChaos (kill aleatorio), StressChaos (CPU)
 ```
 
 ---
 
-## 🚀 Puesta en Marcha en Entorno Local (Docker Compose)
+## 🚀 Despliegue Local (Docker Compose)
 
 ### 1. Ejecutar Pruebas Unitarias
 ```bash
-# Ejecutar todas las pruebas unitarias de la solución (.NET 10)
 dotnet test
 ```
 
-### 2. Construir y Levantar los Contenedores
+### 2. Construir y Levantar Contenedores Locales
 ```bash
 docker compose up --build -d
 ```
 
-### 3. Verificar el Estado de los Contenedores
-```bash
-docker compose ps
-```
-
-### 4. Enlaces de Acceso a Servicios
-| Servicio / Herramienta | URL / Puerto | Descripción |
-| :--- | :--- | :--- |
-| **Passengers API** | `http://localhost:5001` | Microservicio de Pasajeros |
-| **Checkin API** | `http://localhost:5002` | Microservicio de Check-in |
-| **DataAccess API** | `http://localhost:5003` | Microservicio Central de Base de Datos |
-| **Jaeger UI** | `http://localhost:16686` | Backend de Trazas Distribuidas y Spans de BD |
-| **Prometheus** | `http://localhost:9090` | Métricas y Reglas de Alerta / AIOps |
-| **Grafana UI** | `http://localhost:3000` | Dashboards de Observabilidad (`admin` / `admin`) |
+### 3. URLs de Acceso Local
+- **Passengers API**: `http://localhost:5001`
+- **Checkin API**: `http://localhost:5002`
+- **DataAccess API**: `http://localhost:5003`
+- **Jaeger UI**: `http://localhost:16686`
+- **Prometheus**: `http://localhost:9090`
+- **Grafana UI**: `http://localhost:3000` (`admin` / `admin`)
 
 ---
 
-## 🧪 Guía de Pruebas End-to-End
+## ☁️ Guía de Ejecución Paso a Paso en GCP (gcloud CLI & kubectl)
 
-### A. Crear un Pasajero (a través de Passengers API)
+> **Importante para Toma de Evidencias**: Ejecuta los siguientes bloques en orden cronológico en tu consola / Cloud Shell y captura las evidencias solicitadas.
+
+### 📌 Paso 0: Autenticación y Variables de Entorno
 ```bash
-curl -X POST http://localhost:5001/passengers \
-  -H "Content-Type: application/json" \
-  -d '{"id":"PAS-001","firstName":"Carlos","lastName":"Gomez","email":"carlos.gomez@example.com","passportNumber":"P1234567"}'
-```
-
-### B. Consultar el Pasajero Creado
-```bash
-curl http://localhost:5001/passengers/PAS-001
-```
-
-### C. Realizar Check-in (a través de Checkin API)
-```bash
-curl -X POST http://localhost:5002/checkin \
-  -H "Content-Type: application/json" \
-  -d '{"passengerId":"PAS-001","flightNumber":"AV204","seatNumber":"14A","baggageCount":1}'
-```
-
-### D. Consultar el Registro de Check-in
-```bash
-curl http://localhost:5002/checkin/CHK-<ID_GENERADO>
-```
-
----
-
-## 🔍 Verificación de los 3 Pilares de Observabilidad
-
-### 1. Trazas Distribuidas y OTel DB Semantic Conventions en Jaeger (`http://localhost:16686`)
-1. Ingresa a `http://localhost:16686`.
-2. En **Service**, selecciona `checkin-service` y haz clic en **Find Traces**.
-3. Selecciona la traza generada por el `POST /checkin`.
-4. Observa el árbol distribuido de spans:
-   ```text
-   checkin-service: POST /checkin
-   ├── checkin-service: ValidatePassengerHttp
-   │   └── passengers-service: GET /passengers/{id}
-   │       └── data-access-service: GET /passengers/{id}
-   │           └── data-access-service: SELECT FROM "Passengers"  <-- DB Span
-   └── checkin-service: PersistCheckinDataAccess
-       └── data-access-service: POST /checkins
-           └── data-access-service: INSERT INTO "CheckinRecords"  <-- DB Span
-   ```
-5. Al expandir los spans de base de datos generados por `data-access-service`, se visualizan los atributos estandarizados:
-   - `db.system`: `"postgresql"`
-   - `db.name`: `"observability_db"`
-   - `db.statement`: consulta SQL parametrizada (`SELECT ...`, `INSERT ...`)
-   - `net.peer.name`: `"postgres"`
-
-### 2. Métricas y Golden Signals en Prometheus (`http://localhost:9090`)
-- **Latencia P99**:
-  ```promql
-  histogram_quantile(0.99, sum(rate(http_server_request_duration_seconds_bucket[2m])) by (le))
-  ```
-- **Error Rate (5xx)**:
-  ```promql
-  rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[2m]) / rate(http_server_request_duration_seconds_count[2m])
-  ```
-- **Throughput (RPS)**:
-  ```promql
-  sum(rate(http_server_request_duration_seconds_count[2m])) by (service_name)
-  ```
-
-### 3. Logs Correlacionados por `trace_id`
-Inspecciona los logs generados en consola:
-```bash
-docker compose logs data-access | grep trace_id
-```
-Cada registro de log en formato JSON estructurado incluye:
-```json
-{
-  "timestamp": "2026-08-30T13:20:00.123Z",
-  "level": "Information",
-  "service": "data-access-service",
-  "message": "DataAccess: Checkin CHK-001 saved in PostgreSQL for passenger PAS-001",
-  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
-  "span_id": "00f067aa0ba902b7"
-}
-```
-
----
-
-## ⚡ Módulo B: Detección de Anomalías (AIOps) y Regla de Correlación Local
-
-La regla de correlación de anomalías está configurada en `config/alerts.yml` y evaluada en Prometheus:
-
-```yaml
-- alert: CorrelatedErrorRateAndLatencyAnomaly
-  expr: |
-    (
-      rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[2m]) 
-      > 
-      (
-        avg_over_time(rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[10m])[30m:1m]) 
-        + 2 * stddev_over_time(rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[10m])[30m:1m])
-      )
-    )
-    and
-    (
-      histogram_quantile(0.99, sum(rate(http_server_request_duration_seconds_bucket[2m])) by (le)) > 0.200
-    )
-  for: 10s
-```
-
-### Cómo probar el disparo de la alerta localmente:
-Ejecuta una ráfaga que inyecte latencia (>200ms) y fuerce errores 500:
-```powershell
-1..50 | ForEach-Object {
-    Invoke-RestMethod -Uri "http://localhost:5002/checkin?delay=250&error=true" -Method Post -ContentType "application/json" -Body '{"passengerId":"PAS-001","flightNumber":"AV204","seatNumber":"14A","baggageCount":1}' -SkipHttpErrorCheck
-    Start-Sleep -Milliseconds 100
-}
-```
-1. Abre `http://localhost:9090/alerts`.
-2. Verás la alerta `CorrelatedErrorRateAndLatencyAnomaly` en estado **FIRING**.
-3. Haz clic en el enlace `runbook_url` para navegar a Jaeger y extraer el `trace_id` del request fallido.
-
----
-
-## 💥 Módulo D: Experimentos de Caos Controlado
-
-### Experimento 1: Inyección de Latencia en `Passengers` (200ms)
-```powershell
-1..30 | ForEach-Object {
-    Invoke-RestMethod -Uri "http://localhost:5001/passengers/PAS-001?delay=200" -Method Get
-    Start-Sleep -Milliseconds 100
-}
-```
-* **Verificación**: Comprueba en Prometheus que `http_request_duration_seconds` supera el SLO y en Jaeger observa el span alargado en 200ms.
-
-### Experimento 2: Tasa de Error 10% en `DataAccess`
-```powershell
-1..100 | ForEach-Object {
-    $shouldFail = ($_ % 10 -eq 0)
-    $errorParam = if ($shouldFail) { "?error=true" } else { "" }
-    Invoke-RestMethod -Uri "http://localhost:5003/passengers/PAS-001$errorParam" -Method Get -SkipHttpErrorCheck
-    Start-Sleep -Milliseconds 50
-}
-```
-* **Verificación**: Comprueba que el Error Rate sube al 10% y las trazas correspondientes quedan etiquetadas con `error=true` en Jaeger.
-
----
-
-## ☁️ Comandos `gcloud CLI` para la Futura Fase Cloud (Referencia Ordenada)
-
-Para la siguiente etapa de despliegue en Google Cloud Platform (GCP Cloud SQL, GKE, Cloud Monitoring, Cloud Service Mesh y VPC Flow Logs):
-
-```bash
-# 1. Autenticación y configuración del proyecto
+# 1. Autenticarse en Google Cloud
 gcloud auth login
-gcloud config set project <TU_PROJECT_ID>
-gcloud config set compute/region us-central1
 
-# 2. Habilitación de APIs de GCP
+# 2. Configurar ID de Proyecto y Región
+export PROJECT_ID="<TU_GCP_PROJECT_ID>"
+export REGION="us-central1"
+export CLUSTER_NAME="observability-lab-v2"
+export SA_NAME="sa-observability"
+
+gcloud config set project $PROJECT_ID
+gcloud config set compute/region $REGION
+```
+
+---
+
+### 📌 Paso 1: Habilitar APIs Requeridas en GCP
+```bash
 gcloud services enable \
     container.googleapis.com \
     sqladmin.googleapis.com \
     monitoring.googleapis.com \
     logging.googleapis.com \
     mesh.googleapis.com \
-    securitycenter.googleapis.com
+    securitycenter.googleapis.com \
+    artifactregistry.googleapis.com
+```
 
-# 3. Asignación de Roles IAM al Service Account de la carga de trabajo
-gcloud projects add-iam-policy-binding <TU_PROJECT_ID> \
-    --member="serviceAccount:sa-observability@<TU_PROJECT_ID>.iam.gserviceaccount.com" \
-    --role="roles/cloudsql.client"
+---
 
-gcloud projects add-iam-policy-binding <TU_PROJECT_ID> \
-    --member="serviceAccount:sa-observability@<TU_PROJECT_ID>.iam.gserviceaccount.com" \
+### 📌 Paso 2: Crear el Nuevo Clúster GKE Standard (`observability-lab-v2`)
+*Se crea un clúster Standard con Workload Identity habilitado para permitir el despliegue del DaemonSet del OTel Collector y los controladores de Chaos Mesh.*
+
+```bash
+gcloud container clusters create $CLUSTER_NAME \
+    --region=$REGION \
+    --num-nodes=2 \
+    --machine-type=e2-standard-4 \
+    --enable-ip-alias \
+    --workload-pool="${PROJECT_ID}.svc.id.goog" \
+    --project=$PROJECT_ID
+```
+*(📸 **Evidencia**: Captura la salida de `gcloud container clusters list` mostrando el clúster `observability-lab-v2` en estado RUNNING).*
+
+---
+
+### 📌 Paso 3: Obtener Credenciales y Configurar IAM / Workload Identity
+```bash
+# 1. Obtener credenciales de kubectl para el nuevo clúster
+gcloud container clusters get-credentials $CLUSTER_NAME --region=$REGION --project=$PROJECT_ID
+
+# 2. Crear Service Account de GCP para observabilidad (si no existe)
+gcloud iam service-accounts create $SA_NAME \
+    --display-name="Observability Workload SA" \
+    --project=$PROJECT_ID || true
+
+SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+
+# 3. Asignar Roles de Observabilidad y Nube
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member="serviceAccount:${SA_EMAIL}" \
     --role="roles/monitoring.metricWriter"
 
-gcloud projects add-iam-policy-binding <TU_PROJECT_ID> \
-    --member="serviceAccount:sa-observability@<TU_PROJECT_ID>.iam.gserviceaccount.com" \
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member="serviceAccount:${SA_EMAIL}" \
     --role="roles/cloudtrace.agent"
 
-gcloud projects add-iam-policy-binding <TU_PROJECT_ID> \
-    --member="serviceAccount:sa-observability@<TU_PROJECT_ID>.iam.gserviceaccount.com" \
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member="serviceAccount:${SA_EMAIL}" \
     --role="roles/logging.logWriter"
 
-# 4. Habilitación de VPC Flow Logs (Módulo C - Network Observability)
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="roles/logging.viewer"
+```
+
+---
+
+### 📌 Paso 4: Instalar Chaos Mesh en GKE (para Chaos Engineering)
+```bash
+# 1. Crear namespace de Chaos Mesh
+kubectl create namespace chaos-mesh
+
+# 2. Instalar Chaos Mesh mediante Helm
+helm repo add chaos-mesh https://charts.chaos-mesh.org
+helm repo update
+helm install chaos-mesh chaos-mesh/chaos-mesh \
+    --namespace=chaos-mesh \
+    --version 2.6.3 \
+    --set chaosDaemon.runtime=containerd \
+    --set chaosDaemon.socketPath=/run/containerd/containerd.sock
+
+# 3. Verificar instalación
+kubectl get pods -n chaos-mesh
+```
+*(📸 **Evidencia**: Captura la salida de `kubectl get pods -n chaos-mesh` con los pods `chaos-controller-manager` y `chaos-daemon` en estado Running).*
+
+---
+
+### 📌 Paso 5: Configurar Secretos en GitHub Actions y Desplegar
+1. En GitHub, navega a **Settings** $\rightarrow$ **Secrets and variables** $\rightarrow$ **Actions**.
+2. Asegúrate de tener configurados:
+   - `GKE_CLUSTER_NAME_V2`: `observability-lab-v2`
+   - `GKE_CLUSTER_REGION`: `us-central1`
+   - `GCP_PROJECT_ID`: `<TU_PROJECT_ID>`
+   - `GCP_WIF_PROVIDER`: `<TU_WIF_PROVIDER>`
+   - `GCP_SERVICE_ACCOUNT`: `<TU_SERVICE_ACCOUNT_DEPLOY>`
+   - `POSTGRES_USER`: `postgres`
+   - `POSTGRES_PASSWORD`: `postgres`
+   - `POSTGRES_DB`: `observability_db`
+   - `GF_ADMIN_PASSWORD`: `admin`
+3. Ejecuta los workflows de GitHub Actions en el siguiente orden:
+   1. `Deploy Infrastructure Prerequisites to GKE` (`prerequisites.yml`)
+   2. `Deploy Observability Stack to GKE` (`observability-gke.yml`)
+   3. `DataAccess CI/CD` (`data-access.yml`)
+   4. `Passengers CI/CD` (`passengers.yml`)
+   5. `Checkin CI/CD` (`checkin.yml`)
+
+*(📸 **Evidencia**: Captura el historial de GitHub Actions con los 5 workflows en verde).*
+
+---
+
+### 📌 Paso 6: Módulo A — Cloud SQL / Cloud Service Mesh (Observabilidad de Red L7)
+
+#### A.1 Configurar Cloud SQL (Opcional si se utiliza PostgreSQL en GKE o Cloud SQL administrado):
+```bash
+# Crear instancia de Cloud SQL PostgreSQL (si se requiere instancia administrada)
+gcloud sql instances create observability-cloudsql \
+    --database-version=POSTGRES_16 \
+    --tier=db-f1-micro \
+    --region=$REGION \
+    --root-password="postgres_secure_pass" \
+    --project=$PROJECT_ID
+
+gcloud sql databases create observability_db \
+    --instance=observability-cloudsql \
+    --project=$PROJECT_ID
+```
+
+#### A.2 Habilitar Google Cloud Service Mesh en el Clúster:
+```bash
+# Habilitar Service Mesh administrado en el clúster GKE
+gcloud container fleet mesh enable --project=$PROJECT_ID
+
+gcloud container fleet memberships register $CLUSTER_NAME-mem \
+    --gke-cluster=${REGION}/${CLUSTER_NAME} \
+    --enable-workload-identity \
+    --project=$PROJECT_ID
+
+gcloud container fleet mesh update \
+    --management automatic \
+    --memberships $CLUSTER_NAME-mem \
+    --project=$PROJECT_ID
+```
+*(📸 **Evidencia**: Captura `gcloud container fleet mesh describe --project=$PROJECT_ID`).*
+
+---
+
+### 📌 Paso 7: Módulo B — AIOps (Detección de Anomalías en Cloud Monitoring y Prometheus)
+
+#### B.1 Crear Política de Detección de Anomalías en Cloud Monitoring (gcloud CLI):
+```bash
+# Crear política de alerta con condición de anomalía en tasa de error
+gcloud alpha monitoring policies create --policy-from-json='{
+  "displayName": "AIOps - Anomaly Detection: High Error Rate in DataAccess",
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "Error Rate > Baseline + 2sigma",
+      "conditionThreshold": {
+        "filter": "resource.type = \"k8s_container\" AND metric.type = \"custom.googleapis.com/dataaccess/errors/count\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 2,
+        "duration": "60s",
+        "trigger": { "count": 1 },
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_RATE"
+          }
+        ]
+      }
+    }
+  ]
+}'
+```
+
+#### B.2 Verificar Regla AIOps en Prometheus:
+1. Accede a la URL pública de Prometheus (`http://<PROMETHEUS_IP>:9090/alerts`).
+2. Comprueba la regla `CorrelatedErrorRateAndLatencyAnomaly` (evalúa `error_rate > baseline + 2σ` AND `latency_p99 > 200ms`).
+
+---
+
+### 📌 Paso 8: Módulo C — Network Observability & Seguridad
+
+#### C.1 Habilitar VPC Flow Logs en la subred de GKE:
+```bash
 gcloud compute networks subnets update default \
-    --region=us-central1 \
+    --region=$REGION \
     --enable-flow-logs \
     --logging-aggregation-interval=INTERVAL_5_SEC \
     --logging-flow-sampling=0.5 \
     --logging-metadata=INCLUDE_ALL_METADATA
 ```
+*(📸 **Evidencia**: Captura `gcloud compute networks subnets describe default --region=us-central1 | grep -A 5 logConfig`).*
+
+#### C.2 Consultar Logs de Red en Cloud Logging:
+```bash
+gcloud logging read 'resource.type="gce_subnetwork" AND log_name=~"projects/'$PROJECT_ID'/logs/compute.googleapis.com%2Fvpc_flows"' \
+    --limit=5 \
+    --format="json"
+```
+
+---
+
+### 📌 Paso 9: Módulo D — Pruebas de Chaos Engineering con Chaos Mesh
+
+#### D.1 Aplicar Manifiestos de Experimentos de Caos:
+```bash
+kubectl apply -f k8s/gcp/11-chaos-experiments.yaml
+```
+
+#### D.2 Experimento 1: Inyección de Latencia de Red (200ms) en `Passengers`:
+```bash
+# Verificar estado del experimento
+kubectl get networkchaos -n apps
+
+# Enviar tráfico y medir latencia
+PASSENGERS_IP=$(kubectl get svc passengers -n apps -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+for i in {1..20}; do
+  curl -s -w "HTTP: %{http_code} | Tiempo: %{time_total}s\n" -o /dev/null "http://${PASSENGERS_IP}:5001/passengers/PAS-001"
+  sleep 0.5
+done
+```
+*(📸 **Evidencia**: Observa el tiempo de respuesta incrementado en 200ms y el span correspondiente en Jaeger UI).*
+
+#### D.3 Experimento 2: Resiliencia de Pods (Pod Kill aleatorio con HPA 1 a 3 réplicas):
+```bash
+# Monitorear pods y autoscaling en tiempo real
+kubectl get pods -n apps -w
+```
+*(📸 **Evidencia**: Captura los pods terminando y nuevos pods iniciando dentro de los límites de 1 a 3 réplicas).*
+
+---
+
+### 📌 Paso 10: Verificación de Spans en Jaeger y Dashboards en Grafana
+
+1. **Jaeger UI (`http://<JAEGER_IP>:16686`)**:
+   - Selecciona `checkin-service`.
+   - Visualiza la traza completa distribuida de 17 spans con **OTel DB Semantic Conventions** (`db.system="postgresql"`, `db.statement`, `net.peer.name="postgres"`).
+2. **Grafana UI (`http://<GRAFANA_IP>:3000`)**:
+   - Inicia sesión con `admin` / `admin`.
+   - Consulta el dashboard de Golden Signals y navega desde un log con error hacia su traza distribuida mediante el enlace de correlación (`Ver traza completa en Jaeger`).

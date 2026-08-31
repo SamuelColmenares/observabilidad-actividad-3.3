@@ -1,0 +1,96 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# k8s/gcp/07-data-access.yaml — DataAccess Microservice (Acceso Interno ClusterIP)
+# ═══════════════════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-access
+  namespace: apps
+  labels:
+    app: data-access
+    service: data-access-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: data-access
+  template:
+    metadata:
+      labels:
+        app: data-access
+        service: data-access-service
+    spec:
+      containers:
+        - name: data-access
+          image: us-central1-docker.pkg.dev/GCP_PROJECT_ID_PLACEHOLDER/actividad-3-3/data-access:latest
+          env:
+            - name: ASPNETCORE_ENVIRONMENT
+              value: "Production"
+            - name: ASPNETCORE_URLS
+              value: "http://+:8080"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: POSTGRES_PASSWORD
+                  optional: true
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: POSTGRES_USER
+                  optional: true
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: POSTGRES_DB
+                  optional: true
+            - name: ConnectionStrings__DefaultConnection
+              value: "Host=postgres.apps.svc.cluster.local;Port=5432;Database=observability_db;Username=postgres;Password=$(POSTGRES_PASSWORD)"
+            - name: OpenTelemetry__OtlpEndpoint
+              value: "http://otel-collector.observability.svc.cluster.local:4317"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.observability.svc.cluster.local:4317"
+            - name: OTEL_SERVICE_NAME
+              value: "data-access-service"
+          ports:
+            - containerPort: 8080
+              name: http
+          resources:
+            requests:
+              cpu: 100m
+              memory: 200Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+
+---
+# ── Solo acceso interno (ClusterIP)
+apiVersion: v1
+kind: Service
+metadata:
+  name: data-access
+  namespace: apps
+  labels:
+    app: data-access
+spec:
+  selector:
+    app: data-access
+  ports:
+    - name: http
+      port: 5003
+      targetPort: 8080
+  type: ClusterIP

@@ -1,9 +1,19 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# k8s/gcp/03-jaeger.yaml — Jaeger all-in-one (Deployment + Service)
-#
-# NOTA: almacenamiento en memoria (igual que en docker-compose local). Los
-# datos se pierden si el pod se reinicia; suficiente para este laboratorio.
+# k8s/gcp/03-jaeger.yaml — Jaeger all-in-one con PVC y UI pública (LoadBalancer)
 # ═══════════════════════════════════════════════════════════════════════════
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jaeger-data-pvc
+  namespace: observability
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -27,6 +37,14 @@ spec:
           env:
             - name: COLLECTOR_OTLP_ENABLED
               value: "true"
+            - name: SPAN_STORAGE_TYPE
+              value: "badger"
+            - name: BADGER_EPHEMERAL
+              value: "false"
+            - name: BADGER_DIRECTORY_VALUE
+              value: "/badger/data"
+            - name: BADGER_DIRECTORY_KEY
+              value: "/badger/key"
           ports:
             - containerPort: 16686
               name: ui
@@ -45,10 +63,16 @@ spec:
               port: 16686
             initialDelaySeconds: 10
             periodSeconds: 15
+          volumeMounts:
+            - name: jaeger-storage
+              mountPath: /badger
+      volumes:
+        - name: jaeger-storage
+          persistentVolumeClaim:
+            claimName: jaeger-data-pvc
 
 ---
-# type: LoadBalancer — expone la UI de Jaeger para verificación humana de
-# propagación de contexto (Fase 3 del enunciado).
+# type: LoadBalancer — expone la UI de Jaeger públicamente
 apiVersion: v1
 kind: Service
 metadata:
@@ -65,3 +89,4 @@ spec:
       port: 4317
       targetPort: 4317
   type: LoadBalancer
+

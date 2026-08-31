@@ -1,11 +1,6 @@
 # =============================================================================
-# Observability GKE Workflow — Deploy OTel Collector + Jaeger + Prometheus +
-# Grafana to a GKE Autopilot cluster.
-#
-# Reemplaza la parte de "observabilidad" que antes vivía en la VM de GCE
-# (prerequisites.yml). Postgres y Couchbase se quedan en la VM sin cambios.
-#
-# Runs when k8s/gcp/** changes on main, or on demand.
+# Observability GKE Workflow — Deploy OTel Collector (DaemonSet) + Jaeger +
+# Prometheus + Grafana to GKE Cluster v2 with Persistent Volumes.
 # =============================================================================
 
 name: Deploy Observability Stack to GKE
@@ -14,13 +9,18 @@ on:
   push:
     branches: [main]
     paths:
-      - 'k8s/gcp/**'
+      - 'k8s/gcp/00-namespace.yaml'
+      - 'k8s/gcp/01-configmaps.yaml'
+      - 'k8s/gcp/02-otel-collector.yaml'
+      - 'k8s/gcp/03-jaeger.yaml'
+      - 'k8s/gcp/04-prometheus.yaml'
+      - 'k8s/gcp/05-grafana.yaml'
   workflow_dispatch:
 
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-  CLUSTER_NAME: ${{ secrets.GKE_CLUSTER_NAME }}
-  CLUSTER_REGION: ${{ secrets.GKE_CLUSTER_REGION }}
+  CLUSTER_NAME: ${{ secrets.GKE_CLUSTER_NAME_V2 }}
+  CLUSTER_REGION: ${{ secrets.GKE_CLUSTER_REGION || 'us-central1' }}
   NAMESPACE: observability
   GRAFANA_GSA_NAME: grafana-cloudlogging-sa
 
@@ -30,7 +30,7 @@ permissions:
 
 jobs:
   deploy-observability:
-    name: Deploy Observability Stack to GKE Autopilot
+    name: Deploy Observability Stack to GKE
     runs-on: ubuntu-latest
 
     steps:
@@ -47,71 +47,21 @@ jobs:
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
           token_format: access_token
 
-      # ── 3. Setup gcloud CLI + gke-gcloud-auth-plugin (requerido por kubectl) ─
+      # ── 3. Setup gcloud CLI + gke-gcloud-auth-plugin ─────────────────────────
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.PROJECT_ID }}
           install_components: gke-gcloud-auth-plugin
 
-      # ── 4. Enable required APIs (idempotente) ────────────────────────────────
-      - name: Enable required GCP APIs
-        run: |
-          gcloud services enable \
-            container.googleapis.com \
-            cloudresourcemanager.googleapis.com \
-            --project=${{ env.PROJECT_ID }}
-
-          # La habilitación de una API por primera vez tarda unos minutos en
-          # propagarse a los sistemas internos que usa el control plane de GKE.
-          # Sin esta espera, "clusters create-auto" puede fallar con
-          # "Kubernetes Engine API has not been used in project... or it is disabled"
-          # incluso justo después de que "services enable" reportó éxito.
-          echo "Waiting for container.googleapis.com to propagate..."
-          for i in $(seq 1 12); do
-            STATE=$(gcloud services list --enabled \
-              --filter="config.name:container.googleapis.com" \
-              --project=${{ env.PROJECT_ID }} \
-              --format="value(state)" 2>/dev/null || true)
-            if [ "$STATE" = "ENABLED" ]; then
-              echo "container.googleapis.com is ENABLED."
-              break
-            fi
-            echo "Not ready yet (attempt ${i}/12), waiting 15s..."
-            sleep 15
-          done
-
-      # ── 5. Create GKE Autopilot cluster if it doesn't exist (idempotente) ────
-      - name: Ensure GKE Autopilot cluster exists
-        run: |
-          for i in $(seq 1 5); do
-            if gcloud container clusters describe ${{ env.CLUSTER_NAME }} \
-              --region=${{ env.CLUSTER_REGION }} \
-              --project=${{ env.PROJECT_ID }} > /dev/null 2>&1; then
-              echo "Cluster already exists."
-              exit 0
-            fi
-
-            if gcloud container clusters create-auto ${{ env.CLUSTER_NAME }} \
-              --region=${{ env.CLUSTER_REGION }} \
-              --project=${{ env.PROJECT_ID }}; then
-              exit 0
-            fi
-
-            echo "create-auto failed (attempt ${i}/5) — likely API propagation delay. Retrying in 30s..."
-            sleep 30
-          done
-          echo "Failed to create the GKE Autopilot cluster after 5 attempts."
-          exit 1
-
-      # ── 6. Fetch cluster credentials for kubectl ─────────────────────────────
+      # ── 4. Fetch cluster credentials for kubectl ─────────────────────────────
       - name: Get GKE credentials
         run: |
           gcloud container clusters get-credentials ${{ env.CLUSTER_NAME }} \
             --region=${{ env.CLUSTER_REGION }} \
             --project=${{ env.PROJECT_ID }}
 
-      # ── 7. Ensure Grafana's GCP Service Account + Workload Identity binding ──
+      # ── 5. Ensure Grafana GCP Service Account + Workload Identity binding ───
       - name: Ensure Grafana Cloud Logging service account
         run: |
           GSA_EMAIL="${{ env.GRAFANA_GSA_NAME }}@${{ env.PROJECT_ID }}.iam.gserviceaccount.com"
@@ -134,7 +84,7 @@ jobs:
 
           echo "GSA_EMAIL=${GSA_EMAIL}" >> $GITHUB_ENV
 
-      # ── 8. Render manifests (sustituye placeholders) ─────────────────────────
+      # ── 6. Render manifests ─────────────────────────────────────────────────
       - name: Render Kubernetes manifests
         run: |
           mkdir -p /tmp/k8s-gcp-rendered
@@ -145,26 +95,30 @@ jobs:
               "$f" > "/tmp/k8s-gcp-rendered/$(basename "$f")"
           done
 
-      # ── 9. Apply namespace + Grafana admin Secret (idempotente) ──────────────
+      # ── 7. Apply namespace + Grafana admin Secret (idempotente) ──────────────
       - name: Apply namespace and Grafana admin secret
         run: |
           kubectl apply -f /tmp/k8s-gcp-rendered/00-namespace.yaml
 
           kubectl create secret generic grafana-admin-credentials \
             --namespace=${{ env.NAMESPACE }} \
-            --from-literal=admin-password='${{ secrets.GF_ADMIN_PASSWORD }}' \
+            --from-literal=admin-password='${{ secrets.GF_ADMIN_PASSWORD || 'admin' }}' \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      # ── 10. Apply the rest of the observability stack ────────────────────────
+      # ── 8. Apply the observability stack ────────────────────────────────────
       - name: Apply observability stack
         run: |
-          kubectl apply -f /tmp/k8s-gcp-rendered/
+          kubectl apply -f /tmp/k8s-gcp-rendered/01-configmaps.yaml
+          kubectl apply -f /tmp/k8s-gcp-rendered/02-otel-collector.yaml
+          kubectl apply -f /tmp/k8s-gcp-rendered/03-jaeger.yaml
+          kubectl apply -f /tmp/k8s-gcp-rendered/04-prometheus.yaml
+          kubectl apply -f /tmp/k8s-gcp-rendered/05-grafana.yaml
 
-      # ── 11. Wait for LoadBalancer external IPs and print endpoints ───────────
+      # ── 9. Wait for LoadBalancer external IPs and print endpoints ───────────
       - name: Print service endpoints
         run: |
-          echo "Waiting up to 180s for external IPs to be assigned..."
-          for svc in otel-collector jaeger grafana; do
+          echo "Waiting up to 180s for public LoadBalancer IPs..."
+          for svc in jaeger prometheus grafana; do
             for i in $(seq 1 18); do
               IP=$(kubectl get svc "$svc" -n ${{ env.NAMESPACE }} \
                 -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
@@ -174,13 +128,10 @@ jobs:
             echo "${svc}_IP=${IP:-<pending>}" | tee -a $GITHUB_STEP_SUMMARY
           done
 
-          echo ""
-          echo "⚡ ACTION REQUIRED (first deploy only):"
-          echo "   Add/update GitHub secret OTEL_COLLECTOR_ENDPOINT = http://<otel-collector_IP>:4317"
-          echo "   Used by passengers.yml / checkin.yml to send OTLP traffic to the Collector in GKE."
-
-      # ── 12. Health check ──────────────────────────────────────────────────────
+      # ── 10. Health check ────────────────────────────────────────────────────
       - name: Verify observability stack health
         run: |
+          kubectl get daemonsets -n ${{ env.NAMESPACE }}
           kubectl get pods -n ${{ env.NAMESPACE }} -o wide
           kubectl get svc -n ${{ env.NAMESPACE }}
+          kubectl get pvc -n ${{ env.NAMESPACE }}

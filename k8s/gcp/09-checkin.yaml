@@ -1,0 +1,80 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# k8s/gcp/09-checkin.yaml — Checkin Microservice (Acceso Público LoadBalancer)
+# ═══════════════════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkin
+  namespace: apps
+  labels:
+    app: checkin
+    service: checkin-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: checkin
+  template:
+    metadata:
+      labels:
+        app: checkin
+        service: checkin-service
+    spec:
+      containers:
+        - name: checkin
+          image: us-central1-docker.pkg.dev/GCP_PROJECT_ID_PLACEHOLDER/actividad-3-3/checkin:latest
+          env:
+            - name: ASPNETCORE_ENVIRONMENT
+              value: "Production"
+            - name: ASPNETCORE_URLS
+              value: "http://+:8080"
+            - name: Services__PassengersUrl
+              value: "http://passengers.apps.svc.cluster.local:5001"
+            - name: Services__DataAccessUrl
+              value: "http://data-access.apps.svc.cluster.local:5003"
+            - name: OpenTelemetry__OtlpEndpoint
+              value: "http://otel-collector.observability.svc.cluster.local:4317"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.observability.svc.cluster.local:4317"
+            - name: OTEL_SERVICE_NAME
+              value: "checkin-service"
+          ports:
+            - containerPort: 8080
+              name: http
+          resources:
+            requests:
+              cpu: 100m
+              memory: 200Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+
+---
+# ── Acceso público (LoadBalancer)
+apiVersion: v1
+kind: Service
+metadata:
+  name: checkin
+  namespace: apps
+  labels:
+    app: checkin
+spec:
+  selector:
+    app: checkin
+  ports:
+    - name: http
+      port: 5002
+      targetPort: 8080
+  type: LoadBalancer

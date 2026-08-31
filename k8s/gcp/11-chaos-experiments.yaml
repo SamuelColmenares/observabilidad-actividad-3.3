@@ -1,0 +1,62 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# k8s/gcp/11-chaos-experiments.yaml — Experimentos de Chaos Mesh para Passengers
+# ═══════════════════════════════════════════════════════════════════════════
+---
+# ── Experimento 1: Inyección de Latencia de Red (200ms) en Passengers
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: passengers-network-latency
+  namespace: apps
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces:
+      - apps
+    labelSelectors:
+      app: passengers
+  delay:
+    latency: "200ms"
+    jitter: "20ms"
+  direction: to
+  duration: "5m"
+
+---
+# ── Experimento 2: Pod Failure / Pod Kill aleatorio en Passengers (Resiliencia 1-3 pods)
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: passengers-pod-kill-experiment
+  namespace: apps
+spec:
+  action: pod-kill
+  mode: fixed
+  value: "1"
+  selector:
+    namespaces:
+      - apps
+    labelSelectors:
+      app: passengers
+  scheduler:
+    cron: "@every 2m"
+
+---
+# ── Experimento 3: Estrés de CPU en Passengers (Disparo de HPA 1 a 3 réplicas)
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: passengers-cpu-stress
+  namespace: apps
+spec:
+  mode: one
+  selector:
+    namespaces:
+      - apps
+    labelSelectors:
+      app: passengers
+  stressors:
+    cpu:
+      workers: 2
+      load: 80
+  duration: "3m"
