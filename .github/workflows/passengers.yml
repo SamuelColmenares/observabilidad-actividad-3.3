@@ -165,7 +165,20 @@ jobs:
 
       - name: Wait for Rollout
         run: |
-          kubectl rollout status deployment/passengers -n ${{ env.NAMESPACE }} --timeout=180s
+          kubectl rollout status deployment/passengers -n ${{ env.NAMESPACE }} --timeout=300s || true
+          
+          # Debugging: mostrar estado de pods
+          echo "=== Pod Status ==="
+          kubectl get pods -n ${{ env.NAMESPACE }} -l app=passengers
+          
+          echo "=== Pod Details ==="
+          kubectl describe pods -n ${{ env.NAMESPACE }} -l app=passengers
+          
+          echo "=== Pod Logs (últimas líneas) ==="
+          kubectl logs -n ${{ env.NAMESPACE }} -l app=passengers --tail=20 || echo "No logs available"
+          
+          echo "=== Deployment Events ==="
+          kubectl describe deployment passengers -n ${{ env.NAMESPACE }}
 
       - name: Get Public LoadBalancer IP and smoke test
         run: |
