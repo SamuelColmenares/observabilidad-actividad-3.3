@@ -22,7 +22,7 @@ env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   REGION: us-central1
   CLUSTER_NAME: ${{ secrets.GKE_CLUSTER_NAME_V2 }}
-  CLUSTER_REGION: ${{ secrets.GKE_CLUSTER_REGION || 'us-central1' }}
+  CLUSTER_ZONE: ${{ secrets.GKE_CLUSTER_ZONE || 'us-central1-a' }}
   SERVICE_NAME: checkin
   NAMESPACE: apps
   ARTIFACT_REGISTRY: us-central1-docker.pkg.dev
@@ -145,7 +145,7 @@ jobs:
       - name: Get GKE credentials
         run: |
           gcloud container clusters get-credentials ${{ env.CLUSTER_NAME }} \
-            --region=${{ env.CLUSTER_REGION }} \
+            --zone=${{ env.CLUSTER_ZONE }} \
             --project=${{ env.PROJECT_ID }}
 
       - name: Render and Apply Kubernetes manifests
