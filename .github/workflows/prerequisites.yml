@@ -93,6 +93,7 @@ jobs:
             --project=${{ env.PROJECT_ID }} \
             --database-version=POSTGRES_16 \
             --region=${{ env.CLOUD_SQL_REGION }} \
+            --edition=ENTERPRISE \
             --tier=db-f1-micro \
             --storage-size=10GB \
             --storage-type=HDD \
