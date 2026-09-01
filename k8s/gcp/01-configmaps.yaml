@@ -42,6 +42,7 @@ data:
           insecure: true
       prometheus:
         endpoint: 0.0.0.0:8889
+        enable_open_metrics: true
       googlecloud:
         project: ${env:GCP_PROJECT_ID}
         log:
