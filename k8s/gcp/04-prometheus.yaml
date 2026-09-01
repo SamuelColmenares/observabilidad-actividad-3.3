@@ -40,6 +40,7 @@ spec:
             - "--config.file=/etc/prometheus/prometheus.yml"
             - "--storage.tsdb.path=/prometheus"
             - "--web.enable-lifecycle"
+            - "--enable-feature=exemplar-storage"
           ports:
             - containerPort: 9090
               name: http

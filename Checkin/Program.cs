@@ -68,6 +68,7 @@ if (observabilityEnabled)
         {
             metrics
                 .SetResourceBuilder(resourceBuilder)
+                .SetExemplarFilter(ExemplarFilterType.TraceBased)
                 .AddMeter(Diagnostics.ServiceName)
                 .AddMeter("Microsoft.AspNetCore.Hosting")
                 .AddMeter("Microsoft.AspNetCore.Server.Kestrel")

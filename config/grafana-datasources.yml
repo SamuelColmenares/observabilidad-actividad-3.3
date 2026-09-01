@@ -8,8 +8,12 @@ datasources:
     isDefault: true
     jsonData:
       timeInterval: 5s
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: jaeger
 
   - name: Jaeger
+    uid: jaeger
     type: jaeger
     access: proxy
     url: http://jaeger:16686
