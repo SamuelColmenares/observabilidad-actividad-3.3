@@ -163,7 +163,7 @@ jobs:
           kubectl get pods -n ${{ env.NAMESPACE }} -l app=data-access
           
           echo "=== Pod Details ==="
-          kubectl describe pods -n ${{ env.NAMESPACE }} -l app=data-access
+          kubectl describe pods -n ${{ env.NAMESPACE }} -l app=data-access || true
           
           echo "=== Pod Logs (últimas líneas) ==="
           kubectl logs -n ${{ env.NAMESPACE }} -l app=data-access --tail=20 || echo "No logs available"
