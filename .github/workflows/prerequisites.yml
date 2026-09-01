@@ -85,6 +85,10 @@ jobs:
 
       # ── 8. Provision Cloud SQL instance, database and user (idempotente) ────
       - name: Ensure Cloud SQL instance, database & user
+        env:
+          # La API de Cloud SQL Admin rechaza el token WIF directo; forzar
+          # impersonación real (self-impersonation) vía IAM Credentials API.
+          CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
         run: |
           INSTANCE="${{ env.CLOUD_SQL_INSTANCE_NAME }}"
 
