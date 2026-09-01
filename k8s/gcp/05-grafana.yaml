@@ -41,6 +41,8 @@ spec:
         app: grafana
     spec:
       serviceAccountName: grafana-ksa
+      securityContext:
+        fsGroup: 472
       containers:
         - name: grafana
           image: grafana/grafana:latest

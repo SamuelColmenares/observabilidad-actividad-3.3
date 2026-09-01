@@ -2,7 +2,9 @@
 # Prerequisites Workflow — Deploy Infrastructure to GKE (Cluster v2)
 #
 # Elimina la VM de GCE y Couchbase.
-# Despliega en GKE: Namespaces, Secrets, ConfigMaps y PostgreSQL con PVC.
+# Despliega en GKE: Namespaces, Secrets, ConfigMaps.
+# Aprovisiona Cloud SQL (PostgreSQL) y el Service Account con Workload Identity
+# usado por el sidecar Cloud SQL Auth Proxy de DataAccess.
 # =============================================================================
 
 name: Deploy Infrastructure Prerequisites to GKE
@@ -13,13 +15,15 @@ on:
     paths:
       - 'k8s/gcp/00-namespace.yaml'
       - 'k8s/gcp/01-configmaps.yaml'
-      - 'k8s/gcp/06-postgres.yaml'
   workflow_dispatch:
 
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   CLUSTER_NAME: ${{ secrets.GKE_CLUSTER_NAME_V2 }}
   CLUSTER_ZONE: ${{ secrets.GKE_CLUSTER_ZONE || 'us-central1-a' }}
+  CLOUD_SQL_INSTANCE_NAME: observability-lab-pg
+  CLOUD_SQL_REGION: us-central1
+  DATA_ACCESS_GSA_NAME: data-access-sa
 
 permissions:
   contents: read
@@ -79,20 +83,60 @@ jobs:
           sed -e "s/GCP_PROJECT_ID_PLACEHOLDER/${{ env.PROJECT_ID }}/g" \
             k8s/gcp/01-configmaps.yaml | kubectl apply -f -
 
-      # ── 8. Apply PostgreSQL StatefulSet/Deployment with PVC ──────────────────
-      - name: Deploy PostgreSQL with Persistent Storage
+      # ── 8. Provision Cloud SQL instance, database and user (idempotente) ────
+      - name: Ensure Cloud SQL instance, database & user
         run: |
-          kubectl apply -f k8s/gcp/06-postgres.yaml
-          kubectl rollout status deployment/postgres -n apps --timeout=180s || true
+          INSTANCE="${{ env.CLOUD_SQL_INSTANCE_NAME }}"
 
-      # ── 9. Verification ──────────────────────────────────────────────────────
+          gcloud sql instances describe "$INSTANCE" --project=${{ env.PROJECT_ID }} > /dev/null 2>&1 || \
+          gcloud sql instances create "$INSTANCE" \
+            --project=${{ env.PROJECT_ID }} \
+            --database-version=POSTGRES_16 \
+            --region=${{ env.CLOUD_SQL_REGION }} \
+            --tier=db-f1-micro \
+            --storage-size=10GB \
+            --storage-type=HDD \
+            --root-password='${{ secrets.POSTGRES_PASSWORD || 'postgres' }}'
+
+          gcloud sql databases describe '${{ secrets.POSTGRES_DB || 'observability_db' }}' \
+            --instance="$INSTANCE" --project=${{ env.PROJECT_ID }} > /dev/null 2>&1 || \
+          gcloud sql databases create '${{ secrets.POSTGRES_DB || 'observability_db' }}' \
+            --instance="$INSTANCE" --project=${{ env.PROJECT_ID }}
+
+          gcloud sql users set-password postgres \
+            --instance="$INSTANCE" \
+            --project=${{ env.PROJECT_ID }} \
+            --password='${{ secrets.POSTGRES_PASSWORD || 'postgres' }}'
+
+      # ── 9. Ensure DataAccess GCP Service Account + Workload Identity binding ─
+      - name: Ensure DataAccess Cloud SQL service account
+        run: |
+          GSA_EMAIL="${{ env.DATA_ACCESS_GSA_NAME }}@${{ env.PROJECT_ID }}.iam.gserviceaccount.com"
+
+          gcloud iam service-accounts describe "$GSA_EMAIL" \
+            --project=${{ env.PROJECT_ID }} > /dev/null 2>&1 || \
+          gcloud iam service-accounts create ${{ env.DATA_ACCESS_GSA_NAME }} \
+            --project=${{ env.PROJECT_ID }} \
+            --display-name="DataAccess Cloud SQL client"
+
+          gcloud projects add-iam-policy-binding ${{ env.PROJECT_ID }} \
+            --member="serviceAccount:${GSA_EMAIL}" \
+            --role="roles/cloudsql.client" \
+            --condition=None
+
+          gcloud iam service-accounts add-iam-policy-binding "$GSA_EMAIL" \
+            --project=${{ env.PROJECT_ID }} \
+            --role="roles/iam.workloadIdentityUser" \
+            --member="serviceAccount:${{ env.PROJECT_ID }}.svc.id.goog[apps/data-access-ksa]"
+
+      # ── 10. Verification ──────────────────────────────────────────────────────
       - name: Verify Core Infrastructure Status
         run: |
           echo "=== Namespaces ==="
           kubectl get namespaces
           echo ""
-          echo "=== Persistent Volume Claims ==="
-          kubectl get pvc -A
+          echo "=== Cloud SQL instances ==="
+          gcloud sql instances list --project=${{ env.PROJECT_ID }}
           echo ""
           echo "=== Pods in apps namespace ==="
           kubectl get pods -n apps -o wide

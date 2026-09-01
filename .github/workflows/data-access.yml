@@ -25,6 +25,9 @@ env:
   NAMESPACE: apps
   ARTIFACT_REGISTRY: us-central1-docker.pkg.dev
   IMAGE_NAME: us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/actividad-3-3/data-access
+  CLOUD_SQL_INSTANCE_NAME: observability-lab-pg
+  CLOUD_SQL_REGION: us-central1
+  DATA_ACCESS_GSA_NAME: data-access-sa
 
 permissions:
   contents: read
@@ -136,9 +139,13 @@ jobs:
       - name: Render and Apply Kubernetes manifests
         run: |
           IMAGE_TAG=${{ needs.build-and-push.outputs.image_tag }}
+          GSA_EMAIL="${{ env.DATA_ACCESS_GSA_NAME }}@${{ env.PROJECT_ID }}.iam.gserviceaccount.com"
+          INSTANCE_CONNECTION_NAME="${{ env.PROJECT_ID }}:${{ env.CLOUD_SQL_REGION }}:${{ env.CLOUD_SQL_INSTANCE_NAME }}"
 
           sed \
             -e "s|GCP_PROJECT_ID_PLACEHOLDER|${{ env.PROJECT_ID }}|g" \
+            -e "s|DATA_ACCESS_GSA_EMAIL_PLACEHOLDER|${GSA_EMAIL}|g" \
+            -e "s|CLOUD_SQL_INSTANCE_CONNECTION_NAME_PLACEHOLDER|${INSTANCE_CONNECTION_NAME}|g" \
             k8s/gcp/07-data-access.yaml | kubectl apply -f -
 
           # Update container image to exact tag

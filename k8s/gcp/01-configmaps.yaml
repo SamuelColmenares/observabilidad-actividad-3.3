@@ -63,15 +63,8 @@ data:
           receivers: [otlp]
           processors: [memory_limiter, resource, batch]
           exporters: [googlecloud, debug]
-      telemetry:
-        metrics:
-          level: detailed
-          readers:
-            - pull:
-                exporter:
-                  prometheus:
-                    host: 0.0.0.0
-                    port: 8888
+      # Nota: se omite 'telemetry.metrics.readers' — duplica el puerto 8888
+      # que el collector ya expone por defecto y provocaba "address already in use".
 
 ---
 # ── Prometheus ConfigMap (con scraping y alertas AIOps)

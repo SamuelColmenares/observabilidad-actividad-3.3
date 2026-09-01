@@ -60,3 +60,28 @@ spec:
       workers: 2
       load: 80
   duration: "3m"
+
+---
+# ── Experimento 4: Error Rate ~10% en DataAccess (Módulo D)
+# Nota: HTTPChaos aplica el fault a nivel de Pod (mode: fixed-percent selecciona
+# el % de réplicas afectadas), no muestrea un % de requests individuales. Con
+# HPA escalando DataAccess, esto aproxima un error rate ~10% del tráfico total.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: HTTPChaos
+metadata:
+  name: data-access-error-injection
+  namespace: apps
+spec:
+  mode: fixed-percent
+  value: "10"
+  selector:
+    namespaces:
+      - apps
+    labelSelectors:
+      app: data-access
+  target: Request
+  port: 8080
+  path: "*"
+  abort: true
+  duration: "3m"
+
